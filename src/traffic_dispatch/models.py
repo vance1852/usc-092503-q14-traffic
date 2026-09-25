@@ -16,6 +16,8 @@ IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{1,63}$")
 RISK_INDEXES = {"COLLISION", "INJURY", "CONGESTION", "HAZMAT", "SECONDARY", "CUSTOM"}
 RESOURCE_KINDS = {"patrol-unit", "tow-truck", "ambulance", "warning-kit", "evidence-kit", "rapid-response-team"}
 CENTER_KINDS = {"road-section", "command-center", "medical-center", "storage", "patrol-station"}
+CHECK_ITEM_KINDS = {"casualty-transfer", "evidence-collection", "debris-cleanup", "facility-inspection"}
+RELEASE_SCOPES = {"zone", "lane"}
 
 
 def required_text(value: object, field: str, maximum: int = 256) -> str:
@@ -219,6 +221,168 @@ class DispatchRequest:
             ),
             priority=priority,
             idempotency_key=identifier(raw.get("idempotency_key"), "idempotency_key"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryLaneSpec:
+    lane_id: str
+    name: str
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "RecoveryLaneSpec":
+        return cls(
+            lane_id=identifier(raw.get("lane_id"), "lane_id"),
+            name=required_text(raw.get("name"), "车道名称", 128),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryZoneSpec:
+    zone_id: str
+    name: str
+    sequence: int
+    lanes: tuple[RecoveryLaneSpec, ...]
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "RecoveryZoneSpec":
+        sequence = raw.get("sequence")
+        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence <= 0:
+            raise ValidationFailed("封控区 sequence 必须是正整数")
+        lanes_raw = raw.get("lanes")
+        if not isinstance(lanes_raw, list) or not lanes_raw:
+            raise ValidationFailed("封控区必须至少包含一条车道")
+        lanes = tuple(RecoveryLaneSpec.from_dict(item) for item in lanes_raw)
+        lane_ids = [lane.lane_id for lane in lanes]
+        if len(set(lane_ids)) != len(lane_ids):
+            raise ValidationFailed("封控区内车道编号重复")
+        return cls(
+            zone_id=identifier(raw.get("zone_id"), "zone_id"),
+            name=required_text(raw.get("name"), "封控区名称", 128),
+            sequence=sequence,
+            lanes=lanes,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryCheckItemSpec:
+    item_id: str
+    kind: str
+    responsible_unit: str
+    required: bool
+    zone_id: str | None
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "RecoveryCheckItemSpec":
+        kind = required_text(raw.get("kind"), "kind", 40)
+        if kind not in CHECK_ITEM_KINDS:
+            raise ValidationFailed("kind 必须是 casualty-transfer、evidence-collection、debris-cleanup 或 facility-inspection")
+        required = raw.get("required", True)
+        if not isinstance(required, bool):
+            raise ValidationFailed("required 必须是布尔值")
+        zone_id = raw.get("zone_id")
+        return cls(
+            item_id=identifier(raw.get("item_id"), "item_id"),
+            kind=kind,
+            responsible_unit=required_text(raw.get("responsible_unit"), "responsible_unit", 128),
+            required=required,
+            zone_id=None if zone_id is None else identifier(zone_id, "zone_id"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryPlanInput:
+    plan_id: str
+    corridor_id: str
+    restriction_id: int
+    incident_id: str
+    name: str
+    zones: tuple[RecoveryZoneSpec, ...]
+    items: tuple[RecoveryCheckItemSpec, ...]
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "RecoveryPlanInput":
+        restriction_id = raw.get("restriction_id")
+        if isinstance(restriction_id, bool) or not isinstance(restriction_id, int) or restriction_id <= 0:
+            raise ValidationFailed("restriction_id 必须是正整数")
+        zones_raw = raw.get("zones")
+        if not isinstance(zones_raw, list) or not zones_raw:
+            raise ValidationFailed("恢复方案必须至少包含一个封控区")
+        zones = tuple(RecoveryZoneSpec.from_dict(item) for item in zones_raw)
+        zone_ids = [zone.zone_id for zone in zones]
+        if len(set(zone_ids)) != len(zone_ids):
+            raise ValidationFailed("封控区编号重复")
+        sequences = [zone.sequence for zone in zones]
+        if len(set(sequences)) != len(sequences):
+            raise ValidationFailed("封控区阶段顺序重复")
+        items_raw = raw.get("items")
+        if not isinstance(items_raw, list) or not items_raw:
+            raise ValidationFailed("恢复方案必须至少包含一项检查事项")
+        items = tuple(RecoveryCheckItemSpec.from_dict(item) for item in items_raw)
+        item_ids = [item.item_id for item in items]
+        if len(set(item_ids)) != len(item_ids):
+            raise ValidationFailed("检查事项编号重复")
+        known_zones = set(zone_ids)
+        for item in items:
+            if item.zone_id is not None and item.zone_id not in known_zones:
+                raise ValidationFailed(f"检查事项 {item.item_id} 引用了不存在的封控区 {item.zone_id}")
+        lane_ids = [lane.lane_id for zone in zones for lane in zone.lanes]
+        if len(set(lane_ids)) != len(lane_ids):
+            raise ValidationFailed("车道编号重复")
+        return cls(
+            plan_id=identifier(raw.get("plan_id"), "plan_id"),
+            corridor_id=identifier(raw.get("corridor_id"), "corridor_id"),
+            restriction_id=restriction_id,
+            incident_id=identifier(raw.get("incident_id"), "incident_id"),
+            name=required_text(raw.get("name"), "name", 128),
+            zones=zones,
+            items=items,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class EmergencyReleaseInput:
+    release_id: str
+    scope_type: str
+    scope_id: str
+    reason: str
+    expires_at: str
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "EmergencyReleaseInput":
+        scope_type = required_text(raw.get("scope_type"), "scope_type", 16)
+        if scope_type not in RELEASE_SCOPES:
+            raise ValidationFailed("scope_type 必须是 zone 或 lane")
+        expires_at = required_text(raw.get("expires_at"), "expires_at", 40)
+        try:
+            parse_utc(expires_at, "expires_at")
+        except ValueError as exc:
+            raise ValidationFailed(str(exc)) from exc
+        return cls(
+            release_id=identifier(raw.get("release_id"), "release_id"),
+            scope_type=scope_type,
+            scope_id=identifier(raw.get("scope_id"), "scope_id"),
+            reason=required_text(raw.get("reason"), "reason", 256),
+            expires_at=expires_at,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class HazardReportInput:
+    hazard_id: str
+    description: str
+    zone_id: str | None
+    lane_id: str | None
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "HazardReportInput":
+        zone_id = raw.get("zone_id")
+        lane_id = raw.get("lane_id")
+        return cls(
+            hazard_id=identifier(raw.get("hazard_id"), "hazard_id"),
+            description=required_text(raw.get("description"), "description", 256),
+            zone_id=None if zone_id is None else identifier(zone_id, "zone_id"),
+            lane_id=None if lane_id is None else identifier(lane_id, "lane_id"),
         )
 
 

@@ -6,12 +6,22 @@ import hashlib
 import json
 import sqlite3
 from datetime import timedelta
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Iterable, Mapping
 
 from .clock import SystemClock, parse_utc, utc_text
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
-from .models import RiskIndexRecord, ResponseCenter, ResponseResourceLot, DispatchRequest, RoadCorridor, ResponseScenario
+from .models import (
+    EmergencyReleaseInput,
+    HazardReportInput,
+    RecoveryPlanInput,
+    RiskIndexRecord,
+    ResponseCenter,
+    ResponseResourceLot,
+    DispatchRequest,
+    RoadCorridor,
+    ResponseScenario,
+)
 from .planning import (
     AllocationRequest,
     RiskPoint,
@@ -32,9 +42,23 @@ from .storage import initialize, transaction
 
 ROLE_PERMISSIONS = {
     "planner": {"risk_record.write", "catalog.write", "scenario.write", "scenario.run"},
-    "dispatcher": {"dispatch_request.write", "allocation.run", "deployment.write", "inventory.write"},
+    "dispatcher": {
+        "dispatch_request.write",
+        "allocation.run",
+        "deployment.write",
+        "inventory.write",
+        "recovery.receipt",
+        "recovery.hazard.write",
+    },
     "risk": {"outage.write", "scenario.approve", "report.read"},
     "auditor": {"report.read", "audit.read"},
+    "commander": {
+        "recovery.write",
+        "recovery.receipt",
+        "recovery.advance",
+        "recovery.release.emergency",
+        "recovery.hazard.write",
+    },
 }
 
 
@@ -361,6 +385,7 @@ class TrafficDispatchService:
         route = self.connection.execute("SELECT * FROM road_corridors WHERE corridor_id=?", (corridor_id,)).fetchone()
         if route is None:
             raise NotFound("道路走廊不存在")
+        self._settle_corridor_releases(actor_id, corridor_id)
         dispatch_requests = self.connection.execute(
             "SELECT * FROM dispatch_requests WHERE corridor_id=? AND duty_date=? AND state='submitted' "
             "ORDER BY priority,submitted_at,dispatch_id",
@@ -547,6 +572,800 @@ class TrafficDispatchService:
             run_id = int(cursor.lastrowid)
             self._audit("scenario", scenario_id, "scenario.executed", actor_id, {"run_id": run_id})
         return {"run_id": run_id, **result, "replayed": False}
+
+    def create_recovery_plan(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "recovery.write")
+        plan_input = RecoveryPlanInput.from_dict(raw)
+        self.route(plan_input.corridor_id)
+        restriction = self.connection.execute(
+            "SELECT * FROM corridor_restrictions WHERE restriction_id=?", (plan_input.restriction_id,)
+        ).fetchone()
+        if restriction is None:
+            raise NotFound("道路限制不存在")
+        if restriction["corridor_id"] != plan_input.corridor_id:
+            raise ValidationFailed("道路限制不属于该道路走廊")
+        if restriction["state"] not in ("announced", "active"):
+            raise InvalidState("道路限制已关闭或取消，无法建立恢复方案")
+        existing = self.connection.execute(
+            "SELECT plan_id FROM recovery_plans WHERE restriction_id=? AND state!='completed'",
+            (plan_input.restriction_id,),
+        ).fetchone()
+        if existing is not None:
+            raise Conflict("该道路限制已存在进行中的恢复方案")
+        try:
+            with transaction(self.connection, immediate=True):
+                self.connection.execute(
+                    "INSERT INTO recovery_plans(plan_id,corridor_id,restriction_id,incident_id,name,"
+                    "base_capacity_percent,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        plan_input.plan_id,
+                        plan_input.corridor_id,
+                        plan_input.restriction_id,
+                        plan_input.incident_id,
+                        plan_input.name,
+                        restriction["capacity_percent"],
+                        actor_id,
+                        self._now(),
+                    ),
+                )
+                for zone in plan_input.zones:
+                    self.connection.execute(
+                        "INSERT INTO recovery_zones(zone_id,plan_id,name,sequence) VALUES(?,?,?,?)",
+                        (zone.zone_id, plan_input.plan_id, zone.name, zone.sequence),
+                    )
+                    for lane in zone.lanes:
+                        self.connection.execute(
+                            "INSERT INTO recovery_lanes(lane_id,zone_id,name) VALUES(?,?,?)",
+                            (lane.lane_id, zone.zone_id, lane.name),
+                        )
+                for item in plan_input.items:
+                    self.connection.execute(
+                        "INSERT INTO recovery_check_items(item_id,plan_id,zone_id,kind,responsible_unit,required) "
+                        "VALUES(?,?,?,?,?,?)",
+                        (
+                            item.item_id,
+                            plan_input.plan_id,
+                            item.zone_id,
+                            item.kind,
+                            item.responsible_unit,
+                            1 if item.required else 0,
+                        ),
+                    )
+                self._audit(
+                    "recovery_plan",
+                    plan_input.plan_id,
+                    "recovery.plan.created",
+                    actor_id,
+                    {
+                        "corridor_id": plan_input.corridor_id,
+                        "restriction_id": plan_input.restriction_id,
+                        "incident_id": plan_input.incident_id,
+                        "zones": len(plan_input.zones),
+                        "items": len(plan_input.items),
+                    },
+                )
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("恢复方案、封控区、车道或检查事项编号冲突") from exc
+        return self._recovery_plan_view(plan_input.plan_id)
+
+    def _plan_row(self, plan_id: str) -> sqlite3.Row:
+        row = self.connection.execute(
+            "SELECT * FROM recovery_plans WHERE plan_id=?", (plan_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("恢复方案不存在")
+        return row
+
+    def _recovery_plan_view(self, plan_id: str) -> dict[str, Any]:
+        plan = self._plan_row(plan_id)
+        restriction = self.connection.execute(
+            "SELECT state,capacity_percent,ends_at FROM corridor_restrictions WHERE restriction_id=?",
+            (plan["restriction_id"],),
+        ).fetchone()
+        zones: list[dict[str, Any]] = []
+        zone_rows = self.connection.execute(
+            "SELECT * FROM recovery_zones WHERE plan_id=? ORDER BY sequence", (plan_id,)
+        ).fetchall()
+        for zone in zone_rows:
+            lanes = self.connection.execute(
+                "SELECT * FROM recovery_lanes WHERE zone_id=? ORDER BY lane_id", (zone["zone_id"],)
+            ).fetchall()
+            zones.append({
+                "zone_id": zone["zone_id"],
+                "name": zone["name"],
+                "sequence": zone["sequence"],
+                "state": zone["state"],
+                "lanes": [
+                    {
+                        "lane_id": lane["lane_id"],
+                        "name": lane["name"],
+                        "state": lane["state"],
+                        "opened_via": lane["opened_via"],
+                        "opened_at": lane["opened_at"],
+                    }
+                    for lane in lanes
+                ],
+            })
+        items = self.connection.execute(
+            "SELECT i.*,(SELECT count(*) FROM recovery_receipts r WHERE r.item_id=i.item_id) receipt_count "
+            "FROM recovery_check_items i WHERE i.plan_id=? ORDER BY i.item_id",
+            (plan_id,),
+        ).fetchall()
+        releases = self.connection.execute(
+            "SELECT * FROM recovery_emergency_releases WHERE plan_id=? ORDER BY created_at,release_id",
+            (plan_id,),
+        ).fetchall()
+        hazards = self.connection.execute(
+            "SELECT * FROM recovery_hazards WHERE plan_id=? ORDER BY created_at,hazard_id", (plan_id,)
+        ).fetchall()
+        last_sync = self.connection.execute(
+            "SELECT * FROM recovery_capacity_syncs WHERE plan_id=? ORDER BY sync_id DESC LIMIT 1", (plan_id,)
+        ).fetchone()
+        return {
+            "plan_id": plan["plan_id"],
+            "corridor_id": plan["corridor_id"],
+            "restriction_id": plan["restriction_id"],
+            "incident_id": plan["incident_id"],
+            "name": plan["name"],
+            "state": plan["state"],
+            "revision": plan["revision"],
+            "base_capacity_percent": plan["base_capacity_percent"],
+            "current_capacity_percent": restriction["capacity_percent"],
+            "restriction_state": restriction["state"],
+            "zones": zones,
+            "items": [
+                {
+                    "item_id": item["item_id"],
+                    "zone_id": item["zone_id"],
+                    "kind": item["kind"],
+                    "responsible_unit": item["responsible_unit"],
+                    "required": bool(item["required"]),
+                    "state": item["state"],
+                    "receipts": item["receipt_count"],
+                }
+                for item in items
+            ],
+            "emergency_releases": [
+                {
+                    "release_id": release["release_id"],
+                    "scope_type": release["scope_type"],
+                    "scope_id": release["scope_id"],
+                    "reason": release["reason"],
+                    "expires_at": release["expires_at"],
+                    "state": release["state"],
+                    "created_by": release["created_by"],
+                }
+                for release in releases
+            ],
+            "hazards": [
+                {
+                    "hazard_id": hazard["hazard_id"],
+                    "zone_id": hazard["zone_id"],
+                    "lane_id": hazard["lane_id"],
+                    "description": hazard["description"],
+                    "state": hazard["state"],
+                    "created_by": hazard["created_by"],
+                    "created_at": hazard["created_at"],
+                    "resolved_by": hazard["resolved_by"],
+                    "resolved_at": hazard["resolved_at"],
+                }
+                for hazard in hazards
+            ],
+            "last_capacity_sync": None if last_sync is None else {
+                "capacity_percent": last_sync["capacity_percent"],
+                "open_lanes": last_sync["open_lanes"],
+                "total_lanes": last_sync["total_lanes"],
+                "trigger": last_sync["trigger"],
+                "created_at": last_sync["created_at"],
+            },
+        }
+
+    def recovery_plan(self, plan_id: str) -> dict[str, Any]:
+        plan = self._plan_row(plan_id)
+        with transaction(self.connection, immediate=True):
+            self._settle_emergency_releases(plan_id, plan["created_by"])
+        return self._recovery_plan_view(plan_id)
+
+    def recovery_receipt_history(self, plan_id: str) -> dict[str, Any]:
+        self._plan_row(plan_id)
+        rows = self.connection.execute(
+            "SELECT r.*,i.kind,i.responsible_unit FROM recovery_receipts r "
+            "JOIN recovery_check_items i ON i.item_id=r.item_id WHERE i.plan_id=? ORDER BY r.receipt_id",
+            (plan_id,),
+        ).fetchall()
+        return {
+            "plan_id": plan_id,
+            "receipts": [
+                {
+                    "receipt_id": row["receipt_id"],
+                    "item_id": row["item_id"],
+                    "kind": row["kind"],
+                    "responsible_unit": row["responsible_unit"],
+                    "action": row["action"],
+                    "duplicate": bool(row["duplicate"]),
+                    "note": row["note"],
+                    "actor_id": row["actor_id"],
+                    "created_at": row["created_at"],
+                }
+                for row in rows
+            ],
+        }
+
+    def _refresh_zone_state(self, zone_id: str) -> None:
+        stats = self.connection.execute(
+            "SELECT count(*) total,sum(CASE WHEN state='open' THEN 1 ELSE 0 END) open "
+            "FROM recovery_lanes WHERE zone_id=?",
+            (zone_id,),
+        ).fetchone()
+        total = int(stats["total"])
+        open_lanes = int(stats["open"] or 0)
+        state = "open" if open_lanes == total else ("partial" if open_lanes > 0 else "closed")
+        self.connection.execute(
+            "UPDATE recovery_zones SET state=?,revision=revision+1 WHERE zone_id=? AND state!=?",
+            (state, zone_id, state),
+        )
+
+    def _settle_emergency_releases(self, plan_id: str, actor_id: str) -> int:
+        now = parse_utc(self._now())
+        rows = self.connection.execute(
+            "SELECT * FROM recovery_emergency_releases WHERE plan_id=? AND state='active' ORDER BY release_id",
+            (plan_id,),
+        ).fetchall()
+        expired = [row for row in rows if parse_utc(row["expires_at"]) <= now]
+        if not expired:
+            return 0
+        affected_zones: set[str] = set()
+        for release in expired:
+            if release["scope_type"] == "zone":
+                zone_id = release["scope_id"]
+                self.connection.execute(
+                    "UPDATE recovery_lanes SET state='closed',opened_via=NULL,opened_at=NULL,revision=revision+1 "
+                    "WHERE zone_id=? AND opened_via='emergency'",
+                    (zone_id,),
+                )
+                affected_zones.add(zone_id)
+            else:
+                self.connection.execute(
+                    "UPDATE recovery_lanes SET state='closed',opened_via=NULL,opened_at=NULL,revision=revision+1 "
+                    "WHERE lane_id=? AND opened_via='emergency'",
+                    (release["scope_id"],),
+                )
+                lane_zone = self.connection.execute(
+                    "SELECT zone_id FROM recovery_lanes WHERE lane_id=?", (release["scope_id"],)
+                ).fetchone()
+                if lane_zone is not None:
+                    affected_zones.add(lane_zone["zone_id"])
+            self.connection.execute(
+                "UPDATE recovery_emergency_releases SET state='expired',revision=revision+1 WHERE release_id=?",
+                (release["release_id"],),
+            )
+            self._audit(
+                "recovery_plan",
+                plan_id,
+                "recovery.release.expired",
+                actor_id,
+                {"release_id": release["release_id"], "scope_type": release["scope_type"], "scope_id": release["scope_id"]},
+            )
+        for zone_id in sorted(affected_zones):
+            self._refresh_zone_state(zone_id)
+        self._sync_capacity(plan_id, actor_id, "release-expired")
+        return len(expired)
+
+    def _settle_corridor_releases(self, actor_id: str, corridor_id: str) -> None:
+        rows = self.connection.execute(
+            "SELECT DISTINCT plan_id FROM recovery_emergency_releases WHERE state='active' AND plan_id IN "
+            "(SELECT plan_id FROM recovery_plans WHERE corridor_id=?)",
+            (corridor_id,),
+        ).fetchall()
+        if not rows:
+            return
+        with transaction(self.connection, immediate=True):
+            for row in rows:
+                self._settle_emergency_releases(row["plan_id"], actor_id)
+
+    def _sync_capacity(self, plan_id: str, actor_id: str, trigger: str) -> str:
+        plan = self._plan_row(plan_id)
+        stats = self.connection.execute(
+            "SELECT count(*) total,sum(CASE WHEN l.state='open' THEN 1 ELSE 0 END) open "
+            "FROM recovery_lanes l JOIN recovery_zones z ON z.zone_id=l.zone_id WHERE z.plan_id=?",
+            (plan_id,),
+        ).fetchone()
+        total = int(stats["total"])
+        open_lanes = int(stats["open"] or 0)
+        base = Decimal(plan["base_capacity_percent"])
+        fraction = Decimal(open_lanes) / Decimal(total)
+        percent = (base + (Decimal("100") - base) * fraction).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
+        incomplete = self.connection.execute(
+            "SELECT count(*) FROM recovery_check_items WHERE plan_id=? AND required=1 AND state!='completed'",
+            (plan_id,),
+        ).fetchone()[0]
+        open_hazards = self.connection.execute(
+            "SELECT count(*) FROM recovery_hazards WHERE plan_id=? AND state='open'", (plan_id,)
+        ).fetchone()[0]
+        restriction = self.connection.execute(
+            "SELECT * FROM corridor_restrictions WHERE restriction_id=?", (plan["restriction_id"],)
+        ).fetchone()
+        complete = open_lanes == total and incomplete == 0 and open_hazards == 0
+        now = self._now()
+        if complete:
+            if plan["state"] == "completed":
+                return decimal_text(percent)
+            self.connection.execute(
+                "UPDATE recovery_lanes SET opened_via='phase',revision=revision+1 "
+                "WHERE opened_via='emergency' AND zone_id IN (SELECT zone_id FROM recovery_zones WHERE plan_id=?)",
+                (plan_id,),
+            )
+            self.connection.execute(
+                "UPDATE recovery_emergency_releases SET state='closed',revision=revision+1 "
+                "WHERE plan_id=? AND state='active'",
+                (plan_id,),
+            )
+            self.connection.execute(
+                "UPDATE recovery_plans SET state='completed',revision=revision+1 WHERE plan_id=?",
+                (plan_id,),
+            )
+            self.connection.execute(
+                "UPDATE corridor_restrictions SET state='closed',ends_at=?,capacity_percent='100',revision=revision+1 "
+                "WHERE restriction_id=?",
+                (now, plan["restriction_id"]),
+            )
+            self._audit("recovery_plan", plan_id, "recovery.plan.completed", actor_id, {"trigger": trigger})
+        else:
+            if plan["state"] == "completed":
+                self.connection.execute(
+                    "UPDATE recovery_plans SET state='suspended',revision=revision+1 WHERE plan_id=?",
+                    (plan_id,),
+                )
+            state_sql = restriction["state"]
+            ends_at = restriction["ends_at"]
+            if state_sql == "closed":
+                state_sql = "active"
+                ends_at = None
+            if (
+                Decimal(restriction["capacity_percent"]) == percent
+                and state_sql == restriction["state"]
+            ):
+                return decimal_text(percent)
+            self.connection.execute(
+                "UPDATE corridor_restrictions SET capacity_percent=?,state=?,ends_at=?,revision=revision+1 "
+                "WHERE restriction_id=?",
+                (decimal_text(percent), state_sql, ends_at, plan["restriction_id"]),
+            )
+        self.connection.execute(
+            "INSERT INTO recovery_capacity_syncs(plan_id,corridor_id,restriction_id,capacity_percent,"
+            "open_lanes,total_lanes,trigger,actor_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                plan_id,
+                plan["corridor_id"],
+                plan["restriction_id"],
+                "100" if complete else decimal_text(percent),
+                open_lanes,
+                total,
+                trigger,
+                actor_id,
+                now,
+            ),
+        )
+        self._audit(
+            "recovery_plan",
+            plan_id,
+            "recovery.capacity.synced",
+            actor_id,
+            {
+                "trigger": trigger,
+                "capacity_percent": "100" if complete else decimal_text(percent),
+                "open_lanes": open_lanes,
+                "total_lanes": total,
+            },
+        )
+        return "100" if complete else decimal_text(percent)
+
+    def _incomplete_required_items(self, plan_id: str, zone_id: str | None = None) -> list[sqlite3.Row]:
+        if zone_id is None:
+            return self.connection.execute(
+                "SELECT * FROM recovery_check_items WHERE plan_id=? AND required=1 AND state!='completed' "
+                "ORDER BY item_id",
+                (plan_id,),
+            ).fetchall()
+        return self.connection.execute(
+            "SELECT * FROM recovery_check_items WHERE plan_id=? AND required=1 AND state!='completed' "
+            "AND (zone_id IS NULL OR zone_id=?) ORDER BY item_id",
+            (plan_id, zone_id),
+        ).fetchall()
+
+    def confirm_check_item(self, actor_id: str, plan_id: str, item_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "recovery.receipt")
+        key = raw.get("idempotency_key")
+        if not isinstance(key, str) or not key.strip():
+            raise ValidationFailed("idempotency_key 不能为空")
+        key = key.strip()
+        note = str(raw.get("note", "")).strip()
+        request_digest = digest({"action": "confirm", "item_id": item_id, "plan_id": plan_id, "note": note})
+        stored = self.connection.execute(
+            "SELECT request_sha256,response_json FROM traffic_idempotency WHERE scope='recovery_receipt' AND idempotency_key=?",
+            (key,),
+        ).fetchone()
+        if stored is not None:
+            if stored["request_sha256"] != request_digest:
+                raise Conflict("幂等键对应不同回执内容")
+            return json.loads(stored["response_json"])
+        self._plan_row(plan_id)
+        item = self.connection.execute(
+            "SELECT * FROM recovery_check_items WHERE item_id=? AND plan_id=?", (item_id, plan_id)
+        ).fetchone()
+        if item is None:
+            raise NotFound("检查事项不存在")
+        try:
+            with transaction(self.connection, immediate=True):
+                self._settle_emergency_releases(plan_id, actor_id)
+                plan = self._plan_row(plan_id)
+                if plan["state"] == "completed":
+                    raise InvalidState("恢复方案已完结，恢复后问题请通过隐患上报处理")
+                duplicate = item["state"] == "completed"
+                cursor = self.connection.execute(
+                    "INSERT INTO recovery_receipts(item_id,action,duplicate,note,idempotency_key,actor_id,created_at) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (item_id, "confirm", 1 if duplicate else 0, note, key, actor_id, self._now()),
+                )
+                receipt_id = int(cursor.lastrowid)
+                if not duplicate:
+                    self.connection.execute(
+                        "UPDATE recovery_check_items SET state='completed',revision=revision+1 WHERE item_id=?",
+                        (item_id,),
+                    )
+                response = {
+                    "receipt_id": receipt_id,
+                    "plan_id": plan_id,
+                    "item_id": item_id,
+                    "state": "completed",
+                    "duplicate": duplicate,
+                }
+                self.connection.execute(
+                    "INSERT INTO traffic_idempotency(scope,idempotency_key,request_sha256,response_json,created_at) "
+                    "VALUES('recovery_receipt',?,?,?,?)",
+                    (key, request_digest, canonical_json(response), self._now()),
+                )
+                self._audit(
+                    "recovery_plan",
+                    plan_id,
+                    "recovery.receipt.duplicated" if duplicate else "recovery.item.confirmed",
+                    actor_id,
+                    {
+                        "item_id": item_id,
+                        "kind": item["kind"],
+                        "responsible_unit": item["responsible_unit"],
+                        "receipt_id": receipt_id,
+                    },
+                )
+                if not duplicate:
+                    self._sync_capacity(plan_id, actor_id, "item-confirmed")
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("回执幂等键冲突") from exc
+        return response
+
+    def withdraw_check_item(self, actor_id: str, plan_id: str, item_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "recovery.receipt")
+        key = raw.get("idempotency_key")
+        if not isinstance(key, str) or not key.strip():
+            raise ValidationFailed("idempotency_key 不能为空")
+        key = key.strip()
+        note = str(raw.get("note", "")).strip()
+        if not note:
+            raise ValidationFailed("撤回必须填写原因")
+        request_digest = digest({"action": "withdraw", "item_id": item_id, "plan_id": plan_id, "note": note})
+        stored = self.connection.execute(
+            "SELECT request_sha256,response_json FROM traffic_idempotency WHERE scope='recovery_receipt' AND idempotency_key=?",
+            (key,),
+        ).fetchone()
+        if stored is not None:
+            if stored["request_sha256"] != request_digest:
+                raise Conflict("幂等键对应不同回执内容")
+            return json.loads(stored["response_json"])
+        self._plan_row(plan_id)
+        item = self.connection.execute(
+            "SELECT * FROM recovery_check_items WHERE item_id=? AND plan_id=?", (item_id, plan_id)
+        ).fetchone()
+        if item is None:
+            raise NotFound("检查事项不存在")
+        try:
+            with transaction(self.connection, immediate=True):
+                self._settle_emergency_releases(plan_id, actor_id)
+                plan = self._plan_row(plan_id)
+                if plan["state"] == "completed":
+                    raise InvalidState("恢复方案已完结，恢复后问题请通过隐患上报处理")
+                if item["state"] != "completed":
+                    raise InvalidState("检查事项未处于已完成状态，无法撤回")
+                cursor = self.connection.execute(
+                    "INSERT INTO recovery_receipts(item_id,action,duplicate,note,idempotency_key,actor_id,created_at) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (item_id, "withdraw", 0, note, key, actor_id, self._now()),
+                )
+                receipt_id = int(cursor.lastrowid)
+                self.connection.execute(
+                    "UPDATE recovery_check_items SET state='pending',revision=revision+1 WHERE item_id=?",
+                    (item_id,),
+                )
+                response = {
+                    "receipt_id": receipt_id,
+                    "plan_id": plan_id,
+                    "item_id": item_id,
+                    "state": "pending",
+                    "duplicate": False,
+                }
+                self.connection.execute(
+                    "INSERT INTO traffic_idempotency(scope,idempotency_key,request_sha256,response_json,created_at) "
+                    "VALUES('recovery_receipt',?,?,?,?)",
+                    (key, request_digest, canonical_json(response), self._now()),
+                )
+                self._audit(
+                    "recovery_plan",
+                    plan_id,
+                    "recovery.item.withdrawn",
+                    actor_id,
+                    {"item_id": item_id, "kind": item["kind"], "receipt_id": receipt_id, "note": note},
+                )
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("回执幂等键冲突") from exc
+        return response
+
+    def open_zone(self, actor_id: str, plan_id: str, zone_id: str) -> dict[str, Any]:
+        self._require(actor_id, "recovery.advance")
+        self._plan_row(plan_id)
+        zone = self.connection.execute(
+            "SELECT * FROM recovery_zones WHERE zone_id=? AND plan_id=?", (zone_id, plan_id)
+        ).fetchone()
+        if zone is None:
+            raise NotFound("封控区不存在")
+        with transaction(self.connection, immediate=True):
+            self._settle_emergency_releases(plan_id, actor_id)
+            plan = self._plan_row(plan_id)
+            if plan["state"] == "completed":
+                raise InvalidState("恢复方案已完结")
+            if plan["state"] == "suspended":
+                raise InvalidState("存在未处置隐患，恢复方案已挂起")
+            pending_lanes = self.connection.execute(
+                "SELECT count(*) FROM recovery_lanes WHERE zone_id=? AND (state!='open' OR opened_via!='phase')",
+                (zone_id,),
+            ).fetchone()[0]
+            if pending_lanes == 0:
+                raise InvalidState("封控区已开放")
+            blocking = self.connection.execute(
+                "SELECT zone_id FROM recovery_zones WHERE plan_id=? AND sequence<? AND state!='open'",
+                (plan_id, zone["sequence"]),
+            ).fetchone()
+            if blocking is not None:
+                raise InvalidState("必须按阶段顺序恢复，前一阶段封控区尚未开放")
+            incomplete = self._incomplete_required_items(plan_id, zone_id)
+            if incomplete:
+                missing = ",".join(row["item_id"] for row in incomplete)
+                raise InvalidState(f"必需检查事项未完成，不得扩大通行范围: {missing}")
+            now = self._now()
+            self.connection.execute(
+                "UPDATE recovery_lanes SET state='open',opened_via='phase',opened_at=?,revision=revision+1 "
+                "WHERE zone_id=? AND state!='open'",
+                (now, zone_id),
+            )
+            self.connection.execute(
+                "UPDATE recovery_lanes SET opened_via='phase',revision=revision+1 "
+                "WHERE zone_id=? AND opened_via='emergency'",
+                (zone_id,),
+            )
+            self._refresh_zone_state(zone_id)
+            capacity = self._sync_capacity(plan_id, actor_id, "zone-opened")
+            self._audit(
+                "recovery_plan",
+                plan_id,
+                "recovery.zone.opened",
+                actor_id,
+                {"zone_id": zone_id, "sequence": zone["sequence"]},
+            )
+        return {"plan_id": plan_id, "zone_id": zone_id, "zone_state": "open", "capacity_percent": capacity}
+
+    def emergency_release(self, actor_id: str, plan_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "recovery.release.emergency")
+        release_input = EmergencyReleaseInput.from_dict(raw)
+        self._plan_row(plan_id)
+        expires = parse_utc(release_input.expires_at, "expires_at")
+        if expires <= parse_utc(self._now()):
+            raise ValidationFailed("expires_at 必须晚于当前时间")
+        with transaction(self.connection, immediate=True):
+            self._settle_emergency_releases(plan_id, actor_id)
+            plan = self._plan_row(plan_id)
+            if plan["state"] == "completed":
+                raise InvalidState("恢复方案已完结")
+            if release_input.scope_type == "zone":
+                scope = self.connection.execute(
+                    "SELECT z.zone_id id FROM recovery_zones z WHERE z.zone_id=? AND z.plan_id=?",
+                    (release_input.scope_id, plan_id),
+                ).fetchone()
+            else:
+                scope = self.connection.execute(
+                    "SELECT l.lane_id id FROM recovery_lanes l JOIN recovery_zones z ON z.zone_id=l.zone_id "
+                    "WHERE l.lane_id=? AND z.plan_id=?",
+                    (release_input.scope_id, plan_id),
+                ).fetchone()
+            if scope is None:
+                raise NotFound("放行范围不在恢复方案内")
+            now = self._now()
+            try:
+                self.connection.execute(
+                    "INSERT INTO recovery_emergency_releases(release_id,plan_id,scope_type,scope_id,reason,"
+                    "expires_at,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        release_input.release_id,
+                        plan_id,
+                        release_input.scope_type,
+                        release_input.scope_id,
+                        release_input.reason,
+                        utc_text(expires),
+                        actor_id,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise Conflict("紧急放行编号冲突") from exc
+            if release_input.scope_type == "zone":
+                self.connection.execute(
+                    "UPDATE recovery_lanes SET state='open',opened_via='emergency',opened_at=?,revision=revision+1 "
+                    "WHERE zone_id=? AND state!='open'",
+                    (now, release_input.scope_id),
+                )
+                self._refresh_zone_state(release_input.scope_id)
+            else:
+                self.connection.execute(
+                    "UPDATE recovery_lanes SET state='open',opened_via='emergency',opened_at=?,revision=revision+1 "
+                    "WHERE lane_id=? AND state!='open'",
+                    (now, release_input.scope_id),
+                )
+                lane_zone = self.connection.execute(
+                    "SELECT zone_id FROM recovery_lanes WHERE lane_id=?", (release_input.scope_id,)
+                ).fetchone()
+                self._refresh_zone_state(lane_zone["zone_id"])
+            capacity = self._sync_capacity(plan_id, actor_id, "emergency-release")
+            self._audit(
+                "recovery_plan",
+                plan_id,
+                "recovery.release.emergency",
+                actor_id,
+                {
+                    "release_id": release_input.release_id,
+                    "scope_type": release_input.scope_type,
+                    "scope_id": release_input.scope_id,
+                    "reason": release_input.reason,
+                    "expires_at": utc_text(expires),
+                },
+            )
+        return {
+            "release_id": release_input.release_id,
+            "plan_id": plan_id,
+            "state": "active",
+            "expires_at": utc_text(expires),
+            "capacity_percent": capacity,
+        }
+
+    def report_hazard(self, actor_id: str, plan_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "recovery.hazard.write")
+        hazard_input = HazardReportInput.from_dict(raw)
+        self._plan_row(plan_id)
+        with transaction(self.connection, immediate=True):
+            self._settle_emergency_releases(plan_id, actor_id)
+            plan = self._plan_row(plan_id)
+            if hazard_input.zone_id is not None:
+                zone = self.connection.execute(
+                    "SELECT zone_id FROM recovery_zones WHERE zone_id=? AND plan_id=?",
+                    (hazard_input.zone_id, plan_id),
+                ).fetchone()
+                if zone is None:
+                    raise NotFound("隐患封控区不在恢复方案内")
+            if hazard_input.lane_id is not None:
+                lane = self.connection.execute(
+                    "SELECT l.zone_id FROM recovery_lanes l JOIN recovery_zones z ON z.zone_id=l.zone_id "
+                    "WHERE l.lane_id=? AND z.plan_id=?",
+                    (hazard_input.lane_id, plan_id),
+                ).fetchone()
+                if lane is None:
+                    raise NotFound("隐患车道不在恢复方案内")
+                if hazard_input.zone_id is not None and lane["zone_id"] != hazard_input.zone_id:
+                    raise ValidationFailed("隐患车道不属于指定封控区")
+            now = self._now()
+            try:
+                self.connection.execute(
+                    "INSERT INTO recovery_hazards(hazard_id,plan_id,zone_id,lane_id,description,created_by,created_at) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (
+                        hazard_input.hazard_id,
+                        plan_id,
+                        hazard_input.zone_id,
+                        hazard_input.lane_id,
+                        hazard_input.description,
+                        actor_id,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise Conflict("隐患编号冲突") from exc
+            affected_zones: set[str] = set()
+            if hazard_input.lane_id is not None:
+                self.connection.execute(
+                    "UPDATE recovery_lanes SET state='closed',opened_via=NULL,opened_at=NULL,revision=revision+1 "
+                    "WHERE lane_id=?",
+                    (hazard_input.lane_id,),
+                )
+                lane_zone = self.connection.execute(
+                    "SELECT zone_id FROM recovery_lanes WHERE lane_id=?", (hazard_input.lane_id,)
+                ).fetchone()
+                affected_zones.add(lane_zone["zone_id"])
+            elif hazard_input.zone_id is not None:
+                self.connection.execute(
+                    "UPDATE recovery_lanes SET state='closed',opened_via=NULL,opened_at=NULL,revision=revision+1 "
+                    "WHERE zone_id=?",
+                    (hazard_input.zone_id,),
+                )
+                affected_zones.add(hazard_input.zone_id)
+            for zone_id in sorted(affected_zones):
+                self._refresh_zone_state(zone_id)
+            if plan["state"] != "suspended":
+                self.connection.execute(
+                    "UPDATE recovery_plans SET state='suspended',revision=revision+1 WHERE plan_id=?",
+                    (plan_id,),
+                )
+            capacity = self._sync_capacity(plan_id, actor_id, "hazard")
+            self._audit(
+                "recovery_plan",
+                plan_id,
+                "recovery.hazard.reported",
+                actor_id,
+                {
+                    "hazard_id": hazard_input.hazard_id,
+                    "zone_id": hazard_input.zone_id,
+                    "lane_id": hazard_input.lane_id,
+                    "description": hazard_input.description,
+                },
+            )
+        return {
+            "hazard_id": hazard_input.hazard_id,
+            "plan_id": plan_id,
+            "state": "open",
+            "plan_state": "suspended",
+            "capacity_percent": capacity,
+        }
+
+    def resolve_hazard(self, actor_id: str, plan_id: str, hazard_id: str) -> dict[str, Any]:
+        self._require(actor_id, "recovery.hazard.write")
+        self._plan_row(plan_id)
+        hazard = self.connection.execute(
+            "SELECT * FROM recovery_hazards WHERE hazard_id=? AND plan_id=?", (hazard_id, plan_id)
+        ).fetchone()
+        if hazard is None:
+            raise NotFound("隐患不存在")
+        with transaction(self.connection, immediate=True):
+            self._settle_emergency_releases(plan_id, actor_id)
+            if hazard["state"] != "open":
+                raise InvalidState("隐患已处置")
+            now = self._now()
+            self.connection.execute(
+                "UPDATE recovery_hazards SET state='resolved',resolved_by=?,resolved_at=?,revision=revision+1 "
+                "WHERE hazard_id=?",
+                (actor_id, now, hazard_id),
+            )
+            remaining = self.connection.execute(
+                "SELECT count(*) FROM recovery_hazards WHERE plan_id=? AND state='open'", (plan_id,)
+            ).fetchone()[0]
+            plan_state = self._plan_row(plan_id)["state"]
+            if remaining == 0 and plan_state == "suspended":
+                self.connection.execute(
+                    "UPDATE recovery_plans SET state='active',revision=revision+1 WHERE plan_id=?",
+                    (plan_id,),
+                )
+                plan_state = "active"
+            self._audit(
+                "recovery_plan",
+                plan_id,
+                "recovery.hazard.resolved",
+                actor_id,
+                {"hazard_id": hazard_id},
+            )
+        return {"hazard_id": hazard_id, "plan_id": plan_id, "state": "resolved", "plan_state": plan_state}
 
     def audit_chain(self, actor_id: str) -> dict[str, Any]:
         self._require(actor_id, "audit.read")

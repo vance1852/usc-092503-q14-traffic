@@ -14,7 +14,7 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS traffic_users (
     user_id TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
-    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor')),
+    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor','commander')),
     active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
     created_at TEXT NOT NULL
 );
@@ -180,6 +180,117 @@ CREATE TABLE IF NOT EXISTS traffic_idempotency (
     PRIMARY KEY(scope, idempotency_key)
 );
 
+CREATE TABLE IF NOT EXISTS recovery_plans (
+    plan_id TEXT PRIMARY KEY,
+    corridor_id TEXT NOT NULL REFERENCES road_corridors(corridor_id),
+    restriction_id INTEGER NOT NULL REFERENCES corridor_restrictions(restriction_id),
+    incident_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    base_capacity_percent TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','suspended','completed')),
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_by TEXT NOT NULL REFERENCES traffic_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_recovery_plans_restriction
+ON recovery_plans(restriction_id, state);
+
+CREATE TABLE IF NOT EXISTS recovery_zones (
+    zone_id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL REFERENCES recovery_plans(plan_id),
+    name TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    state TEXT NOT NULL DEFAULT 'closed' CHECK(state IN ('closed','partial','open')),
+    revision INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(plan_id, sequence)
+);
+
+CREATE TABLE IF NOT EXISTS recovery_lanes (
+    lane_id TEXT PRIMARY KEY,
+    zone_id TEXT NOT NULL REFERENCES recovery_zones(zone_id),
+    name TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'closed' CHECK(state IN ('closed','open')),
+    opened_via TEXT CHECK(opened_via IN ('phase','emergency')),
+    opened_at TEXT,
+    revision INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE INDEX IF NOT EXISTS idx_recovery_lanes_zone
+ON recovery_lanes(zone_id, state);
+
+CREATE TABLE IF NOT EXISTS recovery_check_items (
+    item_id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL REFERENCES recovery_plans(plan_id),
+    zone_id TEXT REFERENCES recovery_zones(zone_id),
+    kind TEXT NOT NULL
+        CHECK(kind IN ('casualty-transfer','evidence-collection','debris-cleanup','facility-inspection')),
+    responsible_unit TEXT NOT NULL,
+    required INTEGER NOT NULL DEFAULT 1 CHECK(required IN (0,1)),
+    state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','completed')),
+    revision INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE INDEX IF NOT EXISTS idx_recovery_items_plan
+ON recovery_check_items(plan_id, state);
+
+CREATE TABLE IF NOT EXISTS recovery_receipts (
+    receipt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id TEXT NOT NULL REFERENCES recovery_check_items(item_id),
+    action TEXT NOT NULL CHECK(action IN ('confirm','withdraw')),
+    duplicate INTEGER NOT NULL DEFAULT 0 CHECK(duplicate IN (0,1)),
+    note TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    actor_id TEXT NOT NULL REFERENCES traffic_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_recovery_receipts_item
+ON recovery_receipts(item_id, receipt_id);
+
+CREATE TABLE IF NOT EXISTS recovery_emergency_releases (
+    release_id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL REFERENCES recovery_plans(plan_id),
+    scope_type TEXT NOT NULL CHECK(scope_type IN ('zone','lane')),
+    scope_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','expired','closed')),
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_by TEXT NOT NULL REFERENCES traffic_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_recovery_releases_plan
+ON recovery_emergency_releases(plan_id, state, expires_at);
+
+CREATE TABLE IF NOT EXISTS recovery_hazards (
+    hazard_id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL REFERENCES recovery_plans(plan_id),
+    zone_id TEXT REFERENCES recovery_zones(zone_id),
+    lane_id TEXT REFERENCES recovery_lanes(lane_id),
+    description TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'open' CHECK(state IN ('open','resolved')),
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_by TEXT NOT NULL REFERENCES traffic_users(user_id),
+    created_at TEXT NOT NULL,
+    resolved_by TEXT REFERENCES traffic_users(user_id),
+    resolved_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS recovery_capacity_syncs (
+    sync_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id TEXT NOT NULL REFERENCES recovery_plans(plan_id),
+    corridor_id TEXT NOT NULL REFERENCES road_corridors(corridor_id),
+    restriction_id INTEGER NOT NULL REFERENCES corridor_restrictions(restriction_id),
+    capacity_percent TEXT NOT NULL,
+    open_lanes INTEGER NOT NULL,
+    total_lanes INTEGER NOT NULL,
+    trigger TEXT NOT NULL,
+    actor_id TEXT NOT NULL REFERENCES traffic_users(user_id),
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS traffic_audit_events (
     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
     entity_type TEXT NOT NULL,
@@ -209,6 +320,33 @@ def connect(path: str | Path) -> sqlite3.Connection:
 
 def initialize(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
+    _migrate_user_roles(connection)
+
+
+def _migrate_user_roles(connection: sqlite3.Connection) -> None:
+    """为旧库补充 commander 角色：重建 traffic_users 的角色检查约束。"""
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='traffic_users'"
+    ).fetchone()
+    if row is None or "'commander'" in row[0]:
+        return
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        with transaction(connection, immediate=True):
+            connection.execute(
+                "CREATE TABLE traffic_users_migrated ("
+                "user_id TEXT PRIMARY KEY, display_name TEXT NOT NULL, "
+                "role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor','commander')), "
+                "active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)), created_at TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO traffic_users_migrated(user_id,display_name,role,active,created_at) "
+                "SELECT user_id,display_name,role,active,created_at FROM traffic_users"
+            )
+            connection.execute("DROP TABLE traffic_users")
+            connection.execute("ALTER TABLE traffic_users_migrated RENAME TO traffic_users")
+    finally:
+        connection.execute("PRAGMA foreign_keys=ON")
 
 
 @contextmanager

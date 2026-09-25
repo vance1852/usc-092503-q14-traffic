@@ -83,6 +83,24 @@ class JsonApplication:
                 return Response(200, self.service.approve_scenario(actor, parts[1], int(payload["expected_revision"])))
             if method == "POST" and len(parts) == 3 and parts[0] == "scenarios" and parts[2] == "run":
                 return Response(200, self.service.run_scenario(actor, parts[1], payload["as_of_date"]))
+            if method == "POST" and path == "/recovery_plans":
+                return Response(201, self.service.create_recovery_plan(actor, payload))
+            if method == "GET" and len(parts) == 2 and parts[0] == "recovery_plans":
+                return Response(200, self.service.recovery_plan(parts[1]))
+            if method == "GET" and len(parts) == 3 and parts[0] == "recovery_plans" and parts[2] == "receipts":
+                return Response(200, self.service.recovery_receipt_history(parts[1]))
+            if method == "POST" and len(parts) == 5 and parts[0] == "recovery_plans" and parts[2] == "items" and parts[4] == "confirm":
+                return Response(201, self.service.confirm_check_item(actor, parts[1], parts[3], payload))
+            if method == "POST" and len(parts) == 5 and parts[0] == "recovery_plans" and parts[2] == "items" and parts[4] == "withdraw":
+                return Response(201, self.service.withdraw_check_item(actor, parts[1], parts[3], payload))
+            if method == "POST" and len(parts) == 5 and parts[0] == "recovery_plans" and parts[2] == "zones" and parts[4] == "open":
+                return Response(200, self.service.open_zone(actor, parts[1], parts[3]))
+            if method == "POST" and len(parts) == 3 and parts[0] == "recovery_plans" and parts[2] == "emergency_releases":
+                return Response(201, self.service.emergency_release(actor, parts[1], payload))
+            if method == "POST" and len(parts) == 3 and parts[0] == "recovery_plans" and parts[2] == "hazards":
+                return Response(201, self.service.report_hazard(actor, parts[1], payload))
+            if method == "POST" and len(parts) == 5 and parts[0] == "recovery_plans" and parts[2] == "hazards" and parts[4] == "resolve":
+                return Response(200, self.service.resolve_hazard(actor, parts[1], parts[3]))
             if method == "GET" and path == "/audit/chain":
                 return Response(200, self.service.audit_chain(actor))
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
