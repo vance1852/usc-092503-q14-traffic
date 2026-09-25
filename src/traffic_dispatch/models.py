@@ -16,6 +16,13 @@ IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{1,63}$")
 RISK_INDEXES = {"COLLISION", "INJURY", "CONGESTION", "HAZMAT", "SECONDARY", "CUSTOM"}
 RESOURCE_KINDS = {"patrol-unit", "tow-truck", "ambulance", "warning-kit", "evidence-kit", "rapid-response-team"}
 CENTER_KINDS = {"road-section", "command-center", "medical-center", "storage", "patrol-station"}
+RECOVERY_ITEM_KINDS = {
+    "casualty_transport",
+    "evidence_collection",
+    "debris_cleanup",
+    "facility_inspection",
+    "custom",
+}
 
 
 def required_text(value: object, field: str, maximum: int = 256) -> str:
@@ -259,4 +266,103 @@ class ResponseScenario:
             ),
             route_capacity_changes=parsed_road_corridors,
             demand_changes=parsed_demand,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryItemInput:
+    item_id: str
+    item_kind: str
+    responsible_unit: str
+    required: bool
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "RecoveryItemInput":
+        item_kind = required_text(raw.get("item_kind"), "item_kind", 32)
+        if item_kind not in RECOVERY_ITEM_KINDS:
+            raise ValidationFailed("item_kind 不是受支持的检查事项类型")
+        required = raw.get("required", True)
+        if not isinstance(required, bool):
+            raise ValidationFailed("required 必须是布尔值")
+        return cls(
+            item_id=identifier(raw.get("item_id"), "item_id"),
+            item_kind=item_kind,
+            responsible_unit=required_text(raw.get("responsible_unit"), "responsible_unit"),
+            required=required,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryStageInput:
+    stage_id: str
+    sequence: int
+    zone_label: str
+    lane_codes: tuple[str, ...]
+    restored_capacity_percent: Decimal
+    items: tuple[RecoveryItemInput, ...]
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "RecoveryStageInput":
+        lane_codes_raw = raw.get("lane_codes")
+        if not isinstance(lane_codes_raw, (list, tuple)) or not lane_codes_raw:
+            raise ValidationFailed("lane_codes 必须是非空数组")
+        lane_codes = tuple(identifier(code, "lane_codes") for code in lane_codes_raw)
+        if len(set(lane_codes)) != len(lane_codes):
+            raise ValidationFailed("lane_codes 不能重复")
+        items_raw = raw.get("items")
+        if not isinstance(items_raw, (list, tuple)) or not items_raw:
+            raise ValidationFailed("items 必须是非空数组")
+        items = tuple(RecoveryItemInput.from_dict(item) for item in items_raw)
+        return cls(
+            stage_id=identifier(raw.get("stage_id"), "stage_id"),
+            sequence=positive_integer(raw.get("sequence"), "sequence"),
+            zone_label=required_text(raw.get("zone_label"), "zone_label"),
+            lane_codes=lane_codes,
+            restored_capacity_percent=decimal_value(
+                raw.get("restored_capacity_percent"),
+                "restored_capacity_percent",
+                minimum=Decimal("0"),
+                maximum=Decimal("100"),
+            ),
+            items=items,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryPlanInput:
+    plan_id: str
+    corridor_id: str
+    restriction_id: int
+    incident_id: str
+    stages: tuple[RecoveryStageInput, ...]
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "RecoveryPlanInput":
+        restriction_id = raw.get("restriction_id")
+        if isinstance(restriction_id, bool) or not isinstance(restriction_id, int) or restriction_id <= 0:
+            raise ValidationFailed("restriction_id 必须是正整数")
+        stages_raw = raw.get("stages")
+        if not isinstance(stages_raw, (list, tuple)) or not stages_raw:
+            raise ValidationFailed("stages 必须是非空数组")
+        stages = tuple(RecoveryStageInput.from_dict(stage) for stage in stages_raw)
+        sequences = [stage.sequence for stage in stages]
+        if len(set(sequences)) != len(sequences):
+            raise ValidationFailed("stages 的 sequence 不能重复")
+        if len({stage.stage_id for stage in stages}) != len(stages):
+            raise ValidationFailed("stage_id 不能重复")
+        item_ids = [item.item_id for stage in stages for item in stage.items]
+        if len(set(item_ids)) != len(item_ids):
+            raise ValidationFailed("item_id 不能重复")
+        ordered = sorted(stages, key=lambda stage: stage.sequence)
+        percents = [stage.restored_capacity_percent for stage in ordered]
+        if any(later <= earlier for earlier, later in zip(percents, percents[1:])):
+            raise ValidationFailed("恢复通行比例必须按阶段递增")
+        if percents[-1] != Decimal("100"):
+            raise ValidationFailed("最后一个阶段必须恢复 100% 通行能力")
+        return cls(
+            plan_id=identifier(raw.get("plan_id"), "plan_id"),
+            corridor_id=identifier(raw.get("corridor_id"), "corridor_id"),
+            restriction_id=restriction_id,
+            incident_id=identifier(raw.get("incident_id"), "incident_id"),
+            stages=stages,
         )

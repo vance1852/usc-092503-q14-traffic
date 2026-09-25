@@ -11,7 +11,19 @@ from typing import Any, Iterable, Mapping
 
 from .clock import SystemClock, parse_utc, utc_text
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
-from .models import RiskIndexRecord, ResponseCenter, ResponseResourceLot, DispatchRequest, RoadCorridor, ResponseScenario
+from .models import (
+    DispatchRequest,
+    RecoveryPlanInput,
+    ResponseCenter,
+    ResponseResourceLot,
+    RiskIndexRecord,
+    RoadCorridor,
+    ResponseScenario,
+    date_text,
+    decimal_value,
+    identifier,
+    required_text,
+)
 from .planning import (
     AllocationRequest,
     RiskPoint,
@@ -34,6 +46,7 @@ ROLE_PERMISSIONS = {
     "planner": {"risk_record.write", "catalog.write", "scenario.write", "scenario.run"},
     "dispatcher": {"dispatch_request.write", "allocation.run", "deployment.write", "inventory.write"},
     "risk": {"outage.write", "scenario.approve", "report.read"},
+    "commander": {"recovery.write", "recovery.override", "report.read"},
     "auditor": {"report.read", "audit.read"},
 }
 
@@ -257,6 +270,491 @@ class TrafficDispatchService:
             restriction_id = int(cursor.lastrowid)
             self._audit("route", corridor_id, "outage.announced", actor_id, {"restriction_id": restriction_id})
         return {"restriction_id": restriction_id, "corridor_id": corridor_id, "state": "announced"}
+
+    def _recovery_plan_row(self, plan_id: str) -> sqlite3.Row:
+        row = self.connection.execute("SELECT * FROM recovery_plans WHERE plan_id=?", (plan_id,)).fetchone()
+        if row is None:
+            raise NotFound("恢复方案不存在")
+        return row
+
+    def _restriction_row(self, restriction_id: int) -> sqlite3.Row:
+        row = self.connection.execute(
+            "SELECT * FROM corridor_restrictions WHERE restriction_id=?", (restriction_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("道路限制不存在")
+        return row
+
+    def _recovery_stage_row(self, plan_id: str, stage_id: str) -> sqlite3.Row:
+        row = self.connection.execute(
+            "SELECT * FROM recovery_stages WHERE plan_id=? AND stage_id=?", (plan_id, stage_id)
+        ).fetchone()
+        if row is None:
+            raise NotFound("恢复阶段不存在")
+        return row
+
+    def _recovery_item_row(self, plan_id: str, item_id: str) -> sqlite3.Row:
+        row = self.connection.execute(
+            "SELECT i.* FROM recovery_check_items i JOIN recovery_stages s ON s.stage_id=i.stage_id "
+            "WHERE s.plan_id=? AND i.item_id=?",
+            (plan_id, item_id),
+        ).fetchone()
+        if row is None:
+            raise NotFound("检查事项不存在")
+        return row
+
+    def create_recovery_plan(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "recovery.write")
+        plan = RecoveryPlanInput.from_dict(raw)
+        self.route(plan.corridor_id)
+        restriction = self._restriction_row(plan.restriction_id)
+        if restriction["corridor_id"] != plan.corridor_id:
+            raise ValidationFailed("道路限制不属于该道路走廊")
+        if restriction["state"] not in ("announced", "active"):
+            raise InvalidState("道路限制已关闭，无法建立恢复方案")
+        existing = self.connection.execute(
+            "SELECT plan_id FROM recovery_plans WHERE restriction_id=? AND state IN ('draft','active','reopened')",
+            (plan.restriction_id,),
+        ).fetchone()
+        if existing is not None:
+            raise Conflict("该道路限制已有进行中的恢复方案")
+        now = self._now()
+        try:
+            with transaction(self.connection, immediate=True):
+                self.connection.execute(
+                    "INSERT INTO recovery_plans(plan_id,corridor_id,restriction_id,incident_id,created_by,created_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (plan.plan_id, plan.corridor_id, plan.restriction_id, plan.incident_id, actor_id, now),
+                )
+                for stage in plan.stages:
+                    self.connection.execute(
+                        "INSERT INTO recovery_stages(stage_id,plan_id,sequence,zone_label,lane_codes_json,"
+                        "restored_capacity_percent,created_at) VALUES(?,?,?,?,?,?,?)",
+                        (
+                            stage.stage_id,
+                            plan.plan_id,
+                            stage.sequence,
+                            stage.zone_label,
+                            json.dumps(list(stage.lane_codes), ensure_ascii=False),
+                            decimal_text(stage.restored_capacity_percent),
+                            now,
+                        ),
+                    )
+                    for item in stage.items:
+                        self.connection.execute(
+                            "INSERT INTO recovery_check_items(item_id,stage_id,item_kind,responsible_unit,required,created_at) "
+                            "VALUES(?,?,?,?,?,?)",
+                            (item.item_id, stage.stage_id, item.item_kind, item.responsible_unit, 1 if item.required else 0, now),
+                        )
+                self._audit(
+                    "recovery_plan",
+                    plan.plan_id,
+                    "recovery_plan.created",
+                    actor_id,
+                    {"corridor_id": plan.corridor_id, "restriction_id": plan.restriction_id, "stages": len(plan.stages)},
+                )
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("恢复方案、阶段或检查事项编号冲突") from exc
+        return self.recovery_plan(plan.plan_id)
+
+    def activate_recovery_plan(self, actor_id: str, plan_id: str, expected_revision: int) -> dict[str, Any]:
+        self._require(actor_id, "recovery.write")
+        plan = self._recovery_plan_row(plan_id)
+        if plan["state"] != "draft":
+            raise InvalidState("恢复方案不是草稿状态")
+        restriction = self._restriction_row(plan["restriction_id"])
+        if restriction["state"] not in ("announced", "active"):
+            raise InvalidState("道路限制已关闭，无法启动恢复方案")
+        first = self.connection.execute(
+            "SELECT restored_capacity_percent FROM recovery_stages WHERE plan_id=? ORDER BY sequence LIMIT 1",
+            (plan_id,),
+        ).fetchone()
+        if Decimal(first["restored_capacity_percent"]) <= Decimal(restriction["capacity_percent"]):
+            raise ValidationFailed("首个阶段恢复比例必须高于当前限制通行比例")
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "UPDATE recovery_plans SET state='active',activated_at=?,revision=revision+1 "
+                "WHERE plan_id=? AND state='draft' AND revision=?",
+                (self._now(), plan_id, expected_revision),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidState("恢复方案不是当前草稿版本")
+            self._audit("recovery_plan", plan_id, "recovery_plan.activated", actor_id, {})
+        return {"plan_id": plan_id, "state": "active", "revision": expected_revision + 1}
+
+    def confirm_recovery_item(
+        self, actor_id: str, plan_id: str, item_id: str, receipt_key: str, note: str
+    ) -> dict[str, Any]:
+        self._require(actor_id, "recovery.write")
+        plan = self._recovery_plan_row(plan_id)
+        if plan["state"] not in ("active", "reopened"):
+            raise InvalidState("恢复方案未在进行中，不能登记回执")
+        item = self._recovery_item_row(plan_id, item_id)
+        key = identifier(receipt_key, "receipt_key")
+        note_text = required_text(note, "note")
+        same_key = self.connection.execute(
+            "SELECT r.item_id FROM recovery_receipts r JOIN recovery_check_items i ON i.item_id=r.item_id "
+            "JOIN recovery_stages s ON s.stage_id=i.stage_id WHERE r.receipt_key=? AND s.plan_id=?",
+            (key, plan_id),
+        ).fetchall()
+        if any(row["item_id"] != item_id for row in same_key):
+            raise Conflict("回执编号已用于其他检查事项")
+        duplicate = bool(same_key) or item["state"] == "confirmed"
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "INSERT INTO recovery_receipts(item_id,receipt_key,note,duplicate,confirmed_by,confirmed_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (item_id, key, note_text, 1 if duplicate else 0, actor_id, self._now()),
+            )
+            receipt_id = int(cursor.lastrowid)
+            if duplicate:
+                self._audit(
+                    "recovery_plan",
+                    plan_id,
+                    "recovery_item.receipt_duplicated",
+                    actor_id,
+                    {"item_id": item_id, "receipt_id": receipt_id, "receipt_key": key},
+                )
+            else:
+                self.connection.execute(
+                    "UPDATE recovery_check_items SET state='confirmed',revision=revision+1 "
+                    "WHERE item_id=? AND state='pending'",
+                    (item_id,),
+                )
+                self._audit(
+                    "recovery_plan",
+                    plan_id,
+                    "recovery_item.confirmed",
+                    actor_id,
+                    {"item_id": item_id, "receipt_id": receipt_id},
+                )
+        return {"item_id": item_id, "state": "confirmed", "receipt_id": receipt_id, "duplicate": duplicate}
+
+    def withdraw_recovery_item(self, actor_id: str, plan_id: str, item_id: str, reason: str) -> dict[str, Any]:
+        self._require(actor_id, "recovery.write")
+        plan = self._recovery_plan_row(plan_id)
+        if plan["state"] not in ("active", "reopened"):
+            raise InvalidState("恢复方案未在进行中，不能撤回事项")
+        item = self._recovery_item_row(plan_id, item_id)
+        if item["state"] != "confirmed":
+            raise InvalidState("检查事项尚未确认，无法撤回")
+        reason_text = required_text(reason, "reason")
+        with transaction(self.connection, immediate=True):
+            self.connection.execute(
+                "UPDATE recovery_check_items SET state='pending',revision=revision+1 "
+                "WHERE item_id=? AND state='confirmed'",
+                (item_id,),
+            )
+            cursor = self.connection.execute(
+                "INSERT INTO recovery_withdrawals(item_id,reason,withdrawn_by,withdrawn_at) VALUES(?,?,?,?)",
+                (item_id, reason_text, actor_id, self._now()),
+            )
+            withdrawal_id = int(cursor.lastrowid)
+            self._audit(
+                "recovery_plan",
+                plan_id,
+                "recovery_item.withdrawn",
+                actor_id,
+                {"item_id": item_id, "withdrawal_id": withdrawal_id},
+            )
+        return {"item_id": item_id, "state": "pending", "withdrawal_id": withdrawal_id}
+
+    def create_emergency_release(
+        self, actor_id: str, plan_id: str, stage_id: str, reason: str, expires_at: str
+    ) -> dict[str, Any]:
+        self._require(actor_id, "recovery.override")
+        plan = self._recovery_plan_row(plan_id)
+        if plan["state"] not in ("active", "reopened"):
+            raise InvalidState("恢复方案未在进行中，不能紧急放行")
+        stage = self._recovery_stage_row(plan_id, stage_id)
+        if stage["state"] != "pending":
+            raise InvalidState("阶段已解除封控，无需紧急放行")
+        reason_text = required_text(reason, "reason")
+        try:
+            expiry = parse_utc(required_text(expires_at, "expires_at", 40), "expires_at")
+        except ValueError as exc:
+            raise ValidationFailed(str(exc)) from exc
+        if expiry <= self.clock.now():
+            raise ValidationFailed("expires_at 必须晚于当前时间")
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "INSERT INTO recovery_emergency_releases(stage_id,reason,expires_at,created_by,created_at) "
+                "VALUES(?,?,?,?,?)",
+                (stage_id, reason_text, utc_text(expiry), actor_id, self._now()),
+            )
+            release_id = int(cursor.lastrowid)
+            self._audit(
+                "recovery_plan",
+                plan_id,
+                "emergency_release.created",
+                actor_id,
+                {"release_id": release_id, "stage_id": stage_id, "reason": reason_text, "expires_at": utc_text(expiry)},
+            )
+        return {"release_id": release_id, "stage_id": stage_id, "expires_at": utc_text(expiry)}
+
+    def release_recovery_stage(
+        self, actor_id: str, plan_id: str, stage_id: str, emergency_release_id: int | None = None
+    ) -> dict[str, Any]:
+        self._require(actor_id, "recovery.write")
+        if emergency_release_id is not None and (
+            isinstance(emergency_release_id, bool) or not isinstance(emergency_release_id, int)
+        ):
+            raise ValidationFailed("emergency_release_id 必须是正整数")
+        plan = self._recovery_plan_row(plan_id)
+        if plan["state"] not in ("active", "reopened"):
+            raise InvalidState("恢复方案未在进行中，不能解除封控")
+        stage = self._recovery_stage_row(plan_id, stage_id)
+        if stage["state"] != "pending":
+            raise InvalidState("阶段已解除封控")
+        blocker = self.connection.execute(
+            "SELECT stage_id FROM recovery_stages WHERE plan_id=? AND sequence<? AND state!='released' "
+            "ORDER BY sequence LIMIT 1",
+            (plan_id, stage["sequence"]),
+        ).fetchone()
+        if blocker is not None:
+            raise InvalidState("存在未解除的前置阶段，不能扩大通行范围")
+        pending_required = self.connection.execute(
+            "SELECT i.item_id FROM recovery_check_items i JOIN recovery_stages s ON s.stage_id=i.stage_id "
+            "WHERE s.plan_id=? AND s.sequence<=? AND i.required=1 AND i.state!='confirmed' ORDER BY i.item_id",
+            (plan_id, stage["sequence"]),
+        ).fetchall()
+        emergency = None
+        if emergency_release_id is not None:
+            emergency = self.connection.execute(
+                "SELECT * FROM recovery_emergency_releases WHERE release_id=? AND stage_id=?",
+                (emergency_release_id, stage_id),
+            ).fetchone()
+            if emergency is None:
+                raise NotFound("紧急放行记录不存在")
+            if parse_utc(emergency["expires_at"]) <= self.clock.now():
+                raise InvalidState("紧急放行已过有效期")
+        if pending_required and emergency is None:
+            missing = [row["item_id"] for row in pending_required]
+            raise InvalidState(f"必需检查事项未完成，不能扩大通行范围: {','.join(missing)}")
+        now = self._now()
+        remaining = self.connection.execute(
+            "SELECT COUNT(*) AS total FROM recovery_stages WHERE plan_id=? AND sequence>?",
+            (plan_id, stage["sequence"]),
+        ).fetchone()
+        is_final = remaining["total"] == 0
+        with transaction(self.connection, immediate=True):
+            self.connection.execute(
+                "UPDATE recovery_stages SET state='released',released_at=?,released_by=?,emergency_release_id=?,"
+                "revision=revision+1 WHERE stage_id=? AND state='pending'",
+                (now, actor_id, None if emergency is None else emergency["release_id"], stage_id),
+            )
+            if is_final:
+                self.connection.execute(
+                    "UPDATE corridor_restrictions SET state='closed',ends_at=?,capacity_percent=?,revision=revision+1 "
+                    "WHERE restriction_id=?",
+                    (now, stage["restored_capacity_percent"], plan["restriction_id"]),
+                )
+                self.connection.execute(
+                    "UPDATE recovery_plans SET state='completed',completed_at=?,revision=revision+1 WHERE plan_id=?",
+                    (now, plan_id),
+                )
+            else:
+                self.connection.execute(
+                    "UPDATE corridor_restrictions SET capacity_percent=?,revision=revision+1 WHERE restriction_id=?",
+                    (stage["restored_capacity_percent"], plan["restriction_id"]),
+                )
+            self._audit(
+                "recovery_plan",
+                plan_id,
+                "recovery_stage.released",
+                actor_id,
+                {
+                    "stage_id": stage_id,
+                    "zone_label": stage["zone_label"],
+                    "restored_capacity_percent": stage["restored_capacity_percent"],
+                    "emergency_release_id": None if emergency is None else emergency["release_id"],
+                },
+            )
+            if is_final:
+                self._audit(
+                    "recovery_plan",
+                    plan_id,
+                    "recovery_plan.completed",
+                    actor_id,
+                    {"restriction_id": plan["restriction_id"]},
+                )
+        return {
+            "stage_id": stage_id,
+            "state": "released",
+            "restored_capacity_percent": stage["restored_capacity_percent"],
+            "plan_state": "completed" if is_final else plan["state"],
+        }
+
+    def report_recovery_hazard(self, actor_id: str, plan_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "recovery.write")
+        plan = self._recovery_plan_row(plan_id)
+        if plan["state"] not in ("active", "reopened", "completed"):
+            raise InvalidState("恢复方案当前状态不能登记隐患")
+        description = required_text(raw.get("description"), "description")
+        percent = decimal_value(
+            raw.get("capacity_percent"), "capacity_percent", minimum=Decimal("0"), maximum=Decimal("100")
+        )
+        stage_ref = raw.get("stage_id")
+        if stage_ref is not None:
+            stage_ref = identifier(stage_ref, "stage_id")
+            self._recovery_stage_row(plan_id, stage_ref)
+        post_completion = plan["state"] == "completed"
+        if post_completion and percent >= Decimal("100"):
+            raise ValidationFailed("恢复后隐患的安全通行比例必须低于 100")
+        restriction = self._restriction_row(plan["restriction_id"])
+        tighten = not post_completion and percent < Decimal(restriction["capacity_percent"])
+        now = self._now()
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "INSERT INTO recovery_hazards(plan_id,stage_id,description,capacity_percent,post_completion,"
+                "reported_by,reported_at) VALUES(?,?,?,?,?,?,?)",
+                (plan_id, stage_ref, description, decimal_text(percent), 1 if post_completion else 0, actor_id, now),
+            )
+            hazard_id = int(cursor.lastrowid)
+            self._audit(
+                "recovery_plan",
+                plan_id,
+                "recovery_hazard.reported",
+                actor_id,
+                {"hazard_id": hazard_id, "stage_id": stage_ref, "post_completion": post_completion},
+            )
+            if post_completion:
+                self.connection.execute(
+                    "UPDATE recovery_stages SET state='pending',released_at=NULL,released_by=NULL,"
+                    "emergency_release_id=NULL,revision=revision+1 WHERE plan_id=? AND state='released'",
+                    (plan_id,),
+                )
+                self.connection.execute(
+                    "UPDATE corridor_restrictions SET state='announced',ends_at=NULL,capacity_percent=?,"
+                    "revision=revision+1 WHERE restriction_id=?",
+                    (decimal_text(percent), plan["restriction_id"]),
+                )
+                self.connection.execute(
+                    "UPDATE recovery_plans SET state='reopened',completed_at=NULL,revision=revision+1 WHERE plan_id=?",
+                    (plan_id,),
+                )
+                self._audit(
+                    "recovery_plan",
+                    plan_id,
+                    "recovery_plan.reopened",
+                    actor_id,
+                    {"hazard_id": hazard_id, "capacity_percent": decimal_text(percent)},
+                )
+            elif tighten:
+                self.connection.execute(
+                    "UPDATE corridor_restrictions SET capacity_percent=?,revision=revision+1 WHERE restriction_id=?",
+                    (decimal_text(percent), plan["restriction_id"]),
+                )
+                self._audit(
+                    "recovery_plan",
+                    plan_id,
+                    "recovery_capacity.tightened",
+                    actor_id,
+                    {"hazard_id": hazard_id, "capacity_percent": decimal_text(percent)},
+                )
+        return {
+            "hazard_id": hazard_id,
+            "plan_id": plan_id,
+            "plan_state": "reopened" if post_completion else plan["state"],
+            "post_completion": post_completion,
+        }
+
+    def recovery_plan(self, plan_id: str) -> dict[str, Any]:
+        plan = self._recovery_plan_row(plan_id)
+        stages = self.connection.execute(
+            "SELECT * FROM recovery_stages WHERE plan_id=? ORDER BY sequence", (plan_id,)
+        ).fetchall()
+        stage_rows = []
+        for stage in stages:
+            items = self.connection.execute(
+                "SELECT * FROM recovery_check_items WHERE stage_id=? ORDER BY item_id", (stage["stage_id"],)
+            ).fetchall()
+            stage_rows.append(
+                {
+                    "stage_id": stage["stage_id"],
+                    "sequence": stage["sequence"],
+                    "zone_label": stage["zone_label"],
+                    "lane_codes": json.loads(stage["lane_codes_json"]),
+                    "restored_capacity_percent": stage["restored_capacity_percent"],
+                    "state": stage["state"],
+                    "released_at": stage["released_at"],
+                    "released_by": stage["released_by"],
+                    "emergency_release_id": stage["emergency_release_id"],
+                    "items": [
+                        {
+                            "item_id": item["item_id"],
+                            "item_kind": item["item_kind"],
+                            "responsible_unit": item["responsible_unit"],
+                            "required": bool(item["required"]),
+                            "state": item["state"],
+                            "revision": item["revision"],
+                        }
+                        for item in items
+                    ],
+                }
+            )
+        receipts = [
+            dict(row)
+            for row in self.connection.execute(
+                "SELECT r.* FROM recovery_receipts r JOIN recovery_check_items i ON i.item_id=r.item_id "
+                "JOIN recovery_stages s ON s.stage_id=i.stage_id WHERE s.plan_id=? ORDER BY r.receipt_id",
+                (plan_id,),
+            ).fetchall()
+        ]
+        withdrawals = [
+            dict(row)
+            for row in self.connection.execute(
+                "SELECT w.* FROM recovery_withdrawals w JOIN recovery_check_items i ON i.item_id=w.item_id "
+                "JOIN recovery_stages s ON s.stage_id=i.stage_id WHERE s.plan_id=? ORDER BY w.withdrawal_id",
+                (plan_id,),
+            ).fetchall()
+        ]
+        emergency_releases = [
+            dict(row)
+            for row in self.connection.execute(
+                "SELECT e.* FROM recovery_emergency_releases e JOIN recovery_stages s ON s.stage_id=e.stage_id "
+                "WHERE s.plan_id=? ORDER BY e.release_id",
+                (plan_id,),
+            ).fetchall()
+        ]
+        hazards = [
+            dict(row)
+            for row in self.connection.execute(
+                "SELECT * FROM recovery_hazards WHERE plan_id=? ORDER BY hazard_id", (plan_id,)
+            ).fetchall()
+        ]
+        return {
+            "plan_id": plan["plan_id"],
+            "corridor_id": plan["corridor_id"],
+            "restriction_id": plan["restriction_id"],
+            "incident_id": plan["incident_id"],
+            "state": plan["state"],
+            "revision": plan["revision"],
+            "created_by": plan["created_by"],
+            "created_at": plan["created_at"],
+            "activated_at": plan["activated_at"],
+            "completed_at": plan["completed_at"],
+            "stages": stage_rows,
+            "receipts": receipts,
+            "withdrawals": withdrawals,
+            "emergency_releases": emergency_releases,
+            "hazards": hazards,
+        }
+
+    def corridor_capacity(self, corridor_id: str, duty_date: str) -> dict[str, Any]:
+        route = self.connection.execute(
+            "SELECT * FROM road_corridors WHERE corridor_id=?", (corridor_id,)
+        ).fetchone()
+        if route is None:
+            raise NotFound("道路走廊不存在")
+        date_text(duty_date, "duty_date")
+        available = self._capacity_for_date(route, duty_date)
+        return {
+            "corridor_id": corridor_id,
+            "duty_date": duty_date,
+            "hourly_capacity": route["hourly_capacity"],
+            "available_units": decimal_text(available),
+        }
 
     def add_inventory_lot(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         self._require(actor_id, "inventory.write")

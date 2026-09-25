@@ -14,7 +14,7 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS traffic_users (
     user_id TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
-    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','auditor')),
+    role TEXT NOT NULL CHECK(role IN ('planner','dispatcher','risk','commander','auditor')),
     active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
     created_at TEXT NOT NULL
 );
@@ -171,6 +171,100 @@ CREATE TABLE IF NOT EXISTS response_scenario_runs (
     UNIQUE(scenario_id, as_of_date, input_sha256)
 );
 
+CREATE TABLE IF NOT EXISTS recovery_plans (
+    plan_id TEXT PRIMARY KEY,
+    corridor_id TEXT NOT NULL REFERENCES road_corridors(corridor_id),
+    restriction_id INTEGER NOT NULL REFERENCES corridor_restrictions(restriction_id),
+    incident_id TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'draft' CHECK(state IN ('draft','active','reopened','completed')),
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_by TEXT NOT NULL REFERENCES traffic_users(user_id),
+    created_at TEXT NOT NULL,
+    activated_at TEXT,
+    completed_at TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_recovery_plans_open_restriction
+ON recovery_plans(restriction_id) WHERE state IN ('draft','active','reopened');
+
+CREATE TABLE IF NOT EXISTS recovery_stages (
+    stage_id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL REFERENCES recovery_plans(plan_id),
+    sequence INTEGER NOT NULL,
+    zone_label TEXT NOT NULL,
+    lane_codes_json TEXT NOT NULL,
+    restored_capacity_percent TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','released')),
+    released_at TEXT,
+    released_by TEXT,
+    emergency_release_id INTEGER,
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    UNIQUE(plan_id, sequence)
+);
+
+CREATE TABLE IF NOT EXISTS recovery_check_items (
+    item_id TEXT PRIMARY KEY,
+    stage_id TEXT NOT NULL REFERENCES recovery_stages(stage_id),
+    item_kind TEXT NOT NULL
+        CHECK(item_kind IN ('casualty_transport','evidence_collection','debris_cleanup','facility_inspection','custom')),
+    responsible_unit TEXT NOT NULL,
+    required INTEGER NOT NULL DEFAULT 1 CHECK(required IN (0,1)),
+    state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','confirmed')),
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_recovery_items_stage
+ON recovery_check_items(stage_id, state);
+
+CREATE TABLE IF NOT EXISTS recovery_receipts (
+    receipt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id TEXT NOT NULL REFERENCES recovery_check_items(item_id),
+    receipt_key TEXT NOT NULL,
+    note TEXT NOT NULL,
+    duplicate INTEGER NOT NULL DEFAULT 0 CHECK(duplicate IN (0,1)),
+    confirmed_by TEXT NOT NULL REFERENCES traffic_users(user_id),
+    confirmed_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_recovery_receipts_item
+ON recovery_receipts(item_id, receipt_id);
+
+CREATE INDEX IF NOT EXISTS idx_recovery_receipts_key
+ON recovery_receipts(receipt_key);
+
+CREATE TABLE IF NOT EXISTS recovery_withdrawals (
+    withdrawal_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id TEXT NOT NULL REFERENCES recovery_check_items(item_id),
+    reason TEXT NOT NULL,
+    withdrawn_by TEXT NOT NULL REFERENCES traffic_users(user_id),
+    withdrawn_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS recovery_emergency_releases (
+    release_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    stage_id TEXT NOT NULL REFERENCES recovery_stages(stage_id),
+    reason TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES traffic_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS recovery_hazards (
+    hazard_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id TEXT NOT NULL REFERENCES recovery_plans(plan_id),
+    stage_id TEXT REFERENCES recovery_stages(stage_id),
+    description TEXT NOT NULL,
+    capacity_percent TEXT NOT NULL,
+    post_completion INTEGER NOT NULL DEFAULT 0 CHECK(post_completion IN (0,1)),
+    reported_by TEXT NOT NULL REFERENCES traffic_users(user_id),
+    reported_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_recovery_hazards_plan
+ON recovery_hazards(plan_id, hazard_id);
+
 CREATE TABLE IF NOT EXISTS traffic_idempotency (
     scope TEXT NOT NULL,
     idempotency_key TEXT NOT NULL,
@@ -198,7 +292,7 @@ ON traffic_audit_events(entity_type, entity_id, event_id);
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10)
+    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")

@@ -1,15 +1,18 @@
 """依赖标准库的 JSON HTTP API。"""
 from __future__ import annotations
-import argparse,json
+import argparse,json,threading
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from .models import ViolationRecord,CaseRecord
 from .service import PenaltyService
 class Handler(BaseHTTPRequestHandler):
     service=PenaltyService()
+    lock=threading.Lock()
     def _send(self,status,payload):
         data=json.dumps(payload,ensure_ascii=False).encode(); self.send_response(status); self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(data))); self.end_headers(); self.wfile.write(data)
     def _token(self):return self.headers.get("Authorization","").removeprefix("Bearer ")
     def do_GET(self):
+        with self.lock: self._get()
+    def _get(self):
         try:
             if self.path=="/health":return self._send(200,{"status":"ok","service":"urban-enforcement"})
             if self.path.startswith("/case_records/") and self.path.endswith("/risk"):return self._send(200,self.service.risk_report(self._token(),self.path.split("/")[2]))
@@ -18,6 +21,8 @@ class Handler(BaseHTTPRequestHandler):
         except PermissionError as e:return self._send(403,{"error":str(e)})
         except Exception as e:return self._send(400,{"error":str(e)})
     def do_POST(self):
+        with self.lock: self._post()
+    def _post(self):
         try:
             body=json.loads(self.rfile.read(int(self.headers.get("Content-Length","0"))) or b"{}")
             if self.path=="/login":return self._send(200,{"token":self.service.auth.login(body["user_id"],body["password"])})

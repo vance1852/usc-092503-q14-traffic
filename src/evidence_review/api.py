@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -27,6 +28,7 @@ class JsonApplication:
 
     def __init__(self, service: EvidenceReviewService) -> None:
         self.service = service
+        self._lock = threading.Lock()
 
     @staticmethod
     def _actor(headers: Mapping[str, str]) -> str:
@@ -48,6 +50,12 @@ class JsonApplication:
         return value
 
     def handle(
+        self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b""
+    ) -> Response:
+        with self._lock:
+            return self._route(method, target, headers, body)
+
+    def _route(
         self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b""
     ) -> Response:
         normalized_headers = {key.lower(): value for key, value in (headers or {}).items()}

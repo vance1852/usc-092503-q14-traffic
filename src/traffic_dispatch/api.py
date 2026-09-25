@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -24,6 +25,7 @@ class Response:
 class JsonApplication:
     def __init__(self, service: TrafficDispatchService) -> None:
         self.service = service
+        self._lock = threading.Lock()
 
     @staticmethod
     def _actor(headers: Mapping[str, str]) -> str:
@@ -45,6 +47,10 @@ class JsonApplication:
         return value
 
     def handle(self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b"") -> Response:
+        with self._lock:
+            return self._route(method, target, headers, body)
+
+    def _route(self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b"") -> Response:
         normalized = {key.lower(): value for key, value in (headers or {}).items()}
         parsed = urlparse(target)
         path = parsed.path.rstrip("/") or "/"
@@ -67,6 +73,25 @@ class JsonApplication:
                 return Response(201, self.service.create_route(actor, payload))
             if method == "POST" and len(parts) == 3 and parts[0] == "road_corridors" and parts[2] == "outages":
                 return Response(201, self.service.announce_restriction(actor, parts[1], payload["starts_at"], payload.get("ends_at"), payload["capacity_percent"], payload["reason"]))
+            if method == "GET" and len(parts) == 3 and parts[0] == "road_corridors" and parts[2] == "capacity":
+                return Response(200, self.service.corridor_capacity(parts[1], query.get("duty_date", [""])[0]))
+            if method == "POST" and path == "/recovery_plans":
+                return Response(201, self.service.create_recovery_plan(actor, payload))
+            if method == "GET" and len(parts) == 2 and parts[0] == "recovery_plans":
+                return Response(200, self.service.recovery_plan(parts[1]))
+            if method == "POST" and len(parts) == 3 and parts[0] == "recovery_plans" and parts[2] == "activate":
+                return Response(200, self.service.activate_recovery_plan(actor, parts[1], int(payload["expected_revision"])))
+            if method == "POST" and len(parts) == 3 and parts[0] == "recovery_plans" and parts[2] == "receipts":
+                return Response(201, self.service.confirm_recovery_item(actor, parts[1], payload["item_id"], payload["receipt_key"], payload["note"]))
+            if method == "POST" and len(parts) == 3 and parts[0] == "recovery_plans" and parts[2] == "withdrawals":
+                return Response(201, self.service.withdraw_recovery_item(actor, parts[1], payload["item_id"], payload["reason"]))
+            if method == "POST" and len(parts) == 3 and parts[0] == "recovery_plans" and parts[2] == "emergency_releases":
+                return Response(201, self.service.create_emergency_release(actor, parts[1], payload["stage_id"], payload["reason"], payload["expires_at"]))
+            if method == "POST" and len(parts) == 5 and parts[0] == "recovery_plans" and parts[2] == "stages" and parts[4] == "release":
+                release_id = payload.get("emergency_release_id")
+                return Response(200, self.service.release_recovery_stage(actor, parts[1], parts[3], None if release_id is None else int(release_id)))
+            if method == "POST" and len(parts) == 3 and parts[0] == "recovery_plans" and parts[2] == "hazards":
+                return Response(201, self.service.report_recovery_hazard(actor, parts[1], payload))
             if method == "POST" and path == "/inventory/lots":
                 return Response(201, self.service.add_inventory_lot(actor, payload))
             if method == "GET" and path == "/inventory/summary":
